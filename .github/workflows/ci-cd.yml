@@ -1,0 +1,144 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * 1"          # weekly retrain, Monday 09:00 UTC
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  pipeline:
+    name: test, run ETL, train, quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Unit tests (transform, load incl. mocked S3, quality gate)
+        run: pytest tests/test_transform.py tests/test_load.py tests/test_gate.py -q
+
+      - name: Seed sources and run ETL
+        run: |
+          python scripts/seed_sources.py
+          python -m etl.run_etl
+
+      - name: Train and register (fails if the quality gate rejects the model)
+        run: python -m ml.train
+
+      - name: API tests against the new champion
+        run: pytest tests/test_api.py -q
+
+      - name: Export champion model
+        run: python scripts/export_model.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: build/model
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: logs/
+
+  # 1) Build an amd64 image, smoke-test it, then publish amd64 + arm64 images to GHCR.
+  publish:
+    name: build, smoke-test and publish API image
+    needs: pipeline
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: model
+          path: build/model
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image name (GHCR needs lower case)
+        id: name
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}/api" >> "$GITHUB_ENV"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}/api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - name: Build image for the smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the image before publishing
+        run: |
+          docker run -d -p 8000:8000 --name api "$IMAGE:${{ github.sha }}"
+          for i in $(seq 1 30); do curl -sf localhost:8000/health && break; sleep 2; done
+          curl -sf localhost:8000/model-info
+          curl -sf -X POST localhost:8000/predict -H 'content-type: application/json' -d @scripts/sample_orders.json
+      - name: Publish (linux/amd64 and linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+
+  # 2) Continuous deployment to a persistent host: a self-hosted runner on the
+  #    deployment machine pulls the new image and restarts the API, Prometheus and
+  #    Grafana with Docker Compose, then verifies the release. The stack keeps
+  #    running after the job ends. Enable it by registering a self-hosted runner
+  #    and setting the repository variable DEPLOY_ENABLED=true (see README).
+  deploy:
+    name: deploy to host and verify
+    needs: publish
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: self-hosted
+    concurrency: production
+    env:
+      API_IMAGE: ${{ needs.publish.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Pull and (re)start the stack
+        run: |
+          docker compose -f docker-compose.deploy.yml pull
+          docker compose -f docker-compose.deploy.yml up -d --remove-orphans
+      - name: Verify the API is serving the new image
+        run: |
+          for i in $(seq 1 60); do curl -sf localhost:8000/health && break; sleep 2; done
+          curl -sf localhost:8000/model-info
+          docker compose -f docker-compose.deploy.yml ps
+      - name: Send traffic and verify Prometheus scrapes the API
+        run: |
+          bash scripts/traffic.sh http://localhost:8000 300
+          up=0
+          for i in $(seq 1 24); do
+            if curl -s 'http://localhost:9090/api/v1/query?query=up%7Bjob%3D%22superstore-api%22%7D' | grep -q '"1"\]'; then
+              up=1; break
+            fi
+            sleep 5
+          done
+          [ "$up" -eq 1 ] || { echo "Prometheus is not scraping the API"; exit 1; }
+          echo "Prometheus target superstore-api is UP"
+          curl -s 'http://localhost:9090/api/v1/query?query=sum(api_requests_total)'; echo
+          curl -sf localhost:3000/api/health
