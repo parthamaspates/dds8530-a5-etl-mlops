@@ -1,0 +1,34 @@
+# Production-style stack used by the `deploy` job in .github/workflows/ci-cd.yml.
+# Same as docker-compose.yml, but the API runs the image published to GHCR
+# (API_IMAGE=ghcr.io/<owner>/<repo>/api:<commit-sha>) instead of a local build.
+#   API         http://localhost:8000/docs
+#   Prometheus  http://localhost:9090/targets
+#   Grafana     http://localhost:3000  (dashboard "Superstore Model API"; anonymous read-only)
+name: superstore
+services:
+  api:
+    image: ${API_IMAGE:?set API_IMAGE to the image to deploy}
+    ports: ["8000:8000"]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    ports: ["9090:9090"]
+    restart: unless-stopped
+    depends_on: [api]
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    restart: unless-stopped
+    depends_on: [prometheus]

@@ -1,0 +1,4 @@
+# Install Airflow in its own virtual environment, then the project packages:
+#   pip install -r requirements-airflow.txt
+#   pip install "dask[dataframe]" pyarrow scikit-learn mlflow skops holidays matplotlib boto3
+apache-airflow==3.3.2
